@@ -99,9 +99,8 @@ jobs:
       - name: Azure login
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # clientId is embedded per request; clientSecret comes from GitHub Secrets
+          creds: '{"clientId":"ee1d6c45-db72-4d65-8604-12e0401ba22b","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
 
       - name: Install ORAS
         uses: oras-project/setup-oras@v1
