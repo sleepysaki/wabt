@@ -1,0 +1,156 @@
+name: Publish WABT WASM Examples to ACR
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "wasm2c/examples/**/*.wat"
+      - ".github/workflows/publish_wasm.yml"
+  workflow_dispatch:
+    inputs:
+      module_path:
+        description: "Optional single .wat file to build, for example wasm2c/examples/fac/fac.wat"
+        required: false
+        default: ""
+      tag:
+        description: "Optional OCI tag. Defaults to the Git commit SHA."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  ACR_REPOSITORY_PREFIX: ${{ vars.ACR_REPOSITORY_PREFIX || 'wabt' }}
+  MODULE_SOURCE_ROOT: wasm2c/examples
+
+jobs:
+  build-and-push:
+    name: Build WAT examples and push OCI artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate pipeline configuration
+        run: |
+          if [ -z "$ACR_NAME" ]; then
+            echo "Repository variable ACR_NAME is required."
+            exit 1
+          fi
+
+      - name: Install WABT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wabt
+          wat2wasm --version
+
+      - name: Build WASM modules
+        env:
+          MODULE_PATH: ${{ github.event.inputs.module_path }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/wasm-modules
+          : > dist/wasm-modules/modules.tsv
+
+          if [ -n "${MODULE_PATH:-}" ]; then
+            if [ ! -f "$MODULE_PATH" ]; then
+              echo "Requested module_path does not exist: $MODULE_PATH"
+              exit 1
+            fi
+            if [ "${MODULE_PATH##*.}" != "wat" ]; then
+              echo "module_path must point to a .wat file: $MODULE_PATH"
+              exit 1
+            fi
+            mapfile -t module_files < <(printf '%s\n' "$MODULE_PATH")
+          else
+            mapfile -t module_files < <(find "$MODULE_SOURCE_ROOT" -type f -name '*.wat' | sort)
+          fi
+
+          if [ "${#module_files[@]}" -eq 0 ]; then
+            echo "No .wat examples found under $MODULE_SOURCE_ROOT."
+            exit 1
+          fi
+
+          for source in "${module_files[@]}"; do
+            module_name="$(basename "$(dirname "$source")")"
+            output="dist/wasm-modules/${module_name}.wasm"
+
+            wat2wasm "$source" -o "$output"
+            digest="sha256:$(sha256sum "$output" | awk '{print $1}')"
+
+            printf '%s\t%s\t%s\t%s\n' "$module_name" "$source" "$output" "$digest" >> dist/wasm-modules/modules.tsv
+            echo "Built $module_name from $source as $output ($digest)"
+          done
+
+      - name: Upload built WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wabt-wasm-examples
+          path: dist/wasm-modules/*
+          if-no-files-found: error
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Login to ACR
+        run: |
+          set -euo pipefail
+
+          acr_login_server="$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)"
+          token="$(az acr login --name "$ACR_NAME" --expose-token --query accessToken -o tsv)"
+
+          echo "$token" | oras login "$acr_login_server" \
+            --username 00000000-0000-0000-0000-000000000000 \
+            --password-stdin
+
+          echo "ACR_LOGIN_SERVER=$acr_login_server" >> "$GITHUB_ENV"
+
+      - name: Push WASM artifacts
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          tag="${REQUESTED_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="$GITHUB_SHA"
+          fi
+
+          : > dist/wasm-modules/wabt-acr-urls.txt
+
+          while IFS=$'\t' read -r module_name source output digest; do
+            repository="${ACR_REPOSITORY_PREFIX}/${module_name}"
+            reference="${ACR_LOGIN_SERVER}/${repository}:${tag}"
+
+            oras push "$reference" \
+              --artifact-type application/wasm \
+              "$output:application/wasm"
+
+            manifest_url="https://${ACR_LOGIN_SERVER}/v2/${repository}/manifests/${tag}"
+            printf '%s\t%s\t%s\t%s\n' "$module_name" "$digest" "$reference" "$manifest_url" >> dist/wasm-modules/wabt-acr-urls.txt
+
+            echo "Published $module_name"
+            echo "  digest: $digest"
+            echo "  registry reference: $reference"
+            echo "  wabt module_registry_url: $manifest_url"
+          done < dist/wasm-modules/modules.tsv
+
+      - name: Upload published module URL report
+        uses: actions/upload-artifact@v4
+        with:
+          name: wabt-acr-urls
+          path: dist/wasm-modules/wabt-acr-urls.txt
+          if-no-files-found: error
